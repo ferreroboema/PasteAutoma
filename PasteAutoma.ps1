@@ -1,8 +1,11 @@
 param(
     [string]$CsvPath = ".\input.csv",
-    [int]$StartDelayMs = 1000,
-    [int]$StepDelayMs = 350,
-    [int]$EnterDelayMs = 900,
+    [int]$StartDelayMs = 2000,
+    [int]$StepDelayMs = 500,
+    [int]$EnterDelayMs = 3000,
+    [int]$ClipboardTimeoutMs = 5000,
+    [ValidateSet("Clipboard", "Type")]
+    [string]$InputMode = "Clipboard",
     [string]$Hotkey = "Ctrl+Alt+P",
     [switch]$HasHeader,
     [switch]$PasteFirstColumnOnly,
@@ -43,7 +46,127 @@ public static class NativeHotkey {
     [DllImport("user32.dll")]
     public static extern short GetAsyncKeyState(int vKey);
 }
+
+public static class NativeKeyboard {
+    private const uint INPUT_KEYBOARD = 1;
+    private const uint KEYEVENTF_KEYUP = 0x0002;
+    private const uint KEYEVENTF_UNICODE = 0x0004;
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct INPUT {
+        public uint type;
+        public INPUTUNION u;
+    }
+
+    [StructLayout(LayoutKind.Explicit)]
+    public struct INPUTUNION {
+        [FieldOffset(0)]
+        public MOUSEINPUT mi;
+
+        [FieldOffset(0)]
+        public KEYBDINPUT ki;
+
+        [FieldOffset(0)]
+        public HARDWAREINPUT hi;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct MOUSEINPUT {
+        public int dx;
+        public int dy;
+        public uint mouseData;
+        public uint dwFlags;
+        public uint time;
+        public UIntPtr dwExtraInfo;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct KEYBDINPUT {
+        public ushort wVk;
+        public ushort wScan;
+        public uint dwFlags;
+        public uint time;
+        public UIntPtr dwExtraInfo;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct HARDWAREINPUT {
+        public uint uMsg;
+        public ushort wParamL;
+        public ushort wParamH;
+    }
+
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
+
+    public static void SendVirtualKey(ushort virtualKey) {
+        INPUT[] inputs = new INPUT[2];
+        inputs[0].type = INPUT_KEYBOARD;
+        inputs[0].u.ki.wVk = virtualKey;
+
+        inputs[1].type = INPUT_KEYBOARD;
+        inputs[1].u.ki.wVk = virtualKey;
+        inputs[1].u.ki.dwFlags = KEYEVENTF_KEYUP;
+
+        SendAll(inputs, "virtual key " + virtualKey);
+    }
+
+    public static void SendCtrlV() {
+        INPUT[] inputs = new INPUT[4];
+
+        inputs[0].type = INPUT_KEYBOARD;
+        inputs[0].u.ki.wVk = 0x11;
+
+        inputs[1].type = INPUT_KEYBOARD;
+        inputs[1].u.ki.wVk = 0x56;
+
+        inputs[2].type = INPUT_KEYBOARD;
+        inputs[2].u.ki.wVk = 0x56;
+        inputs[2].u.ki.dwFlags = KEYEVENTF_KEYUP;
+
+        inputs[3].type = INPUT_KEYBOARD;
+        inputs[3].u.ki.wVk = 0x11;
+        inputs[3].u.ki.dwFlags = KEYEVENTF_KEYUP;
+
+        SendAll(inputs, "Ctrl+V");
+    }
+
+    public static void SendUnicodeCharacter(char character) {
+        INPUT[] inputs = new INPUT[2];
+
+        inputs[0].type = INPUT_KEYBOARD;
+        inputs[0].u.ki.wScan = character;
+        inputs[0].u.ki.dwFlags = KEYEVENTF_UNICODE;
+
+        inputs[1].type = INPUT_KEYBOARD;
+        inputs[1].u.ki.wScan = character;
+        inputs[1].u.ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP;
+
+        SendAll(inputs, "unicode character");
+    }
+
+    private static void SendAll(INPUT[] inputs, string label) {
+        uint sent = SendInput((uint)inputs.Length, inputs, Marshal.SizeOf(typeof(INPUT)));
+        if (sent != inputs.Length) {
+            int error = Marshal.GetLastWin32Error();
+            throw new InvalidOperationException(
+                "SendInput failed for " + label + ". Sent " + sent + " of " + inputs.Length +
+                " input event(s). Win32 error: " + error + "."
+            );
+        }
+    }
+}
 "@
+
+function Write-Log {
+    param(
+        [string]$Message,
+        [string]$Level = "INFO"
+    )
+
+    $timestamp = Get-Date -Format "HH:mm:ss.fff"
+    Write-Host "[$timestamp][$Level] $Message"
+}
 
 function Get-HotkeyParts {
     param([string]$Value)
@@ -115,16 +238,90 @@ function Read-CsvRows {
     }
 }
 
+function Send-Key {
+    param(
+        [uint16]$VirtualKey,
+        [int]$DelayMs = 40
+    )
+
+    [NativeKeyboard]::SendVirtualKey($VirtualKey)
+    Start-Sleep -Milliseconds $DelayMs
+}
+
+function Send-CtrlV {
+    param([int]$DelayMs = 40)
+
+    [NativeKeyboard]::SendCtrlV()
+    Start-Sleep -Milliseconds $DelayMs
+}
+
+function Send-Text {
+    param(
+        [string]$Text,
+        [int]$ChunkDelayMs = 20
+    )
+
+    foreach ($character in $Text.ToCharArray()) {
+        [NativeKeyboard]::SendUnicodeCharacter($character)
+        if ($ChunkDelayMs -gt 0) {
+            Start-Sleep -Milliseconds $ChunkDelayMs
+        }
+    }
+}
+
+function Set-ClipboardTextWithRetry {
+    param(
+        [string]$Text,
+        [int]$TimeoutMs
+    )
+
+    $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMs)
+    $lastError = $null
+
+    while ([DateTime]::UtcNow -lt $deadline) {
+        try {
+            [System.Windows.Forms.Clipboard]::SetDataObject($Text, $true, 10, 100)
+            Start-Sleep -Milliseconds 120
+            if ([System.Windows.Forms.Clipboard]::GetText() -eq $Text) {
+                return
+            }
+        } catch {
+            $lastError = $_.Exception.Message
+        }
+
+        Start-Sleep -Milliseconds 100
+    }
+
+    if ($lastError) {
+        throw "Clipboard did not accept text within $TimeoutMs ms. Last error: $lastError"
+    }
+
+    throw "Clipboard did not contain the expected text within $TimeoutMs ms."
+}
+
+function Get-Preview {
+    param([string]$Text)
+
+    $oneLine = $Text -replace "\s+", " "
+    if ($oneLine.Length -le 80) {
+        return $oneLine
+    }
+
+    return "$($oneLine.Substring(0, 77))..."
+}
+
 function Invoke-PasteRows {
     param(
         [string[]]$Rows,
         [int]$InitialDelayMs,
         [int]$DelayMs,
         [int]$AfterEnterDelayMs,
+        [int]$ClipboardWaitMs,
+        [string]$Mode,
         [bool]$CanStopWithEscape
     )
 
-    Write-Host "Starting in $InitialDelayMs ms. Keep the target cell/field focused..."
+    Write-Log "Starting in $InitialDelayMs ms. Keep the target cell/field focused..."
     Start-Sleep -Milliseconds $InitialDelayMs
 
     $oldClipboard = $null
@@ -137,30 +334,39 @@ function Invoke-PasteRows {
     try {
         for ($i = 0; $i -lt $Rows.Count; $i++) {
             if ($CanStopWithEscape -and ([NativeHotkey]::GetAsyncKeyState(0x1B) -band 0x8000)) {
-                Write-Host "Stopped on Escape after $i row(s)."
+                Write-Log "Stopped on Escape after $i row(s)." "WARN"
                 return
             }
 
-            [System.Windows.Forms.SendKeys]::SendWait("{F2}")
+            $rowNumber = $i + 1
+            $preview = Get-Preview -Text $Rows[$i]
+            Write-Log "Row $rowNumber/$($Rows.Count): F2. Value: $preview"
+            Send-Key -VirtualKey 0x71
             Start-Sleep -Milliseconds $DelayMs
 
-            [System.Windows.Forms.Clipboard]::SetText($Rows[$i])
-            Start-Sleep -Milliseconds 60
+            if ($Mode -eq "Type") {
+                Write-Log "Row $rowNumber/$($Rows.Count): type text."
+                Send-Text -Text $Rows[$i]
+            } else {
+                Write-Log "Row $rowNumber/$($Rows.Count): loading clipboard."
+                Set-ClipboardTextWithRetry -Text $Rows[$i] -TimeoutMs $ClipboardWaitMs
 
-            [System.Windows.Forms.SendKeys]::SendWait("^v")
+                Write-Log "Row $rowNumber/$($Rows.Count): paste."
+                Send-CtrlV
+            }
             Start-Sleep -Milliseconds $DelayMs
 
-            [System.Windows.Forms.SendKeys]::SendWait("{ENTER}")
+            Write-Log "Row $rowNumber/$($Rows.Count): Enter."
+            Send-Key -VirtualKey 0x0D
             Start-Sleep -Milliseconds $AfterEnterDelayMs
 
-            Write-Progress -Activity "Pasting CSV rows" -Status "$($i + 1) / $($Rows.Count)" -PercentComplete ((($i + 1) / $Rows.Count) * 100)
+            Write-Log "Row $rowNumber/$($Rows.Count): done."
         }
 
-        Write-Progress -Activity "Pasting CSV rows" -Completed
-        Write-Host "Done. Pasted $($Rows.Count) row(s)."
+        Write-Log "Done. Pasted $($Rows.Count) row(s)."
     } finally {
         if ($null -ne $oldClipboard) {
-            try { [System.Windows.Forms.Clipboard]::SetText($oldClipboard) } catch {}
+            try { [System.Windows.Forms.Clipboard]::SetDataObject($oldClipboard, $true, 10, 100) } catch {}
         }
     }
 }
@@ -178,11 +384,12 @@ if (-not $registered) {
     throw "Could not register hotkey $Hotkey. Another app may already be using it."
 }
 
-Write-Host "Loaded $($rows.Count) row(s) from $resolvedCsvPath"
-Write-Host "Put the cursor in the target place, then press $Hotkey."
-Write-Host "Keep this PowerShell window open. Press Ctrl+C here to quit."
+Write-Log "Loaded $($rows.Count) row(s) from $resolvedCsvPath"
+Write-Log "Put the cursor in the target place, then press $Hotkey."
+Write-Log "Input mode: $InputMode"
+Write-Log "Keep this PowerShell window open. Press Ctrl+C here to quit."
 if ($StopOnEscape) {
-    Write-Host "While running, hold Escape to stop after the current step."
+    Write-Log "While running, hold Escape to stop after the current step."
 }
 
 try {
@@ -190,8 +397,8 @@ try {
         $message = New-Object NativeHotkey+MSG
         while ([NativeHotkey]::PeekMessage([ref]$message, [IntPtr]::Zero, 0, 0, 1)) {
             if ($message.message -eq 0x0312 -and $message.wParam.ToInt32() -eq $hotkeyId) {
-                Invoke-PasteRows -Rows $rows -InitialDelayMs $StartDelayMs -DelayMs $StepDelayMs -AfterEnterDelayMs $EnterDelayMs -CanStopWithEscape:$StopOnEscape.IsPresent
-                Write-Host "Ready again. Press $Hotkey to run from the first CSV row."
+                Invoke-PasteRows -Rows $rows -InitialDelayMs $StartDelayMs -DelayMs $StepDelayMs -AfterEnterDelayMs $EnterDelayMs -ClipboardWaitMs $ClipboardTimeoutMs -Mode $InputMode -CanStopWithEscape:$StopOnEscape.IsPresent
+                Write-Log "Ready again. Press $Hotkey to run from the first CSV row."
             }
         }
 

@@ -16,6 +16,8 @@ It is useful for tools where each value must be edited one field at a time and n
 - Starts from a global hotkey, default `Ctrl+Alt+P`.
 - Preserves your previous clipboard contents when it finishes.
 - Supports configurable delays, including a separate delay after `Enter`.
+- Logs every row and action in the terminal while it runs.
+- Can use clipboard paste mode or direct typing mode.
 - Can paste either a whole row as tab-separated text or only the first column.
 - Optional `Escape` stop behavior while a run is active.
 
@@ -58,9 +60,11 @@ F2, paste row text, Enter
 Defaults:
 
 ```text
-StartDelayMs = 1000
-StepDelayMs  = 350
-EnterDelayMs = 900
+StartDelayMs = 5000
+StepDelayMs  = 5000
+EnterDelayMs = 5000
+ClipboardTimeoutMs = 5000
+InputMode = Clipboard
 ```
 
 Increase only the pause after `Enter`:
@@ -79,6 +83,18 @@ Give yourself more time after pressing the shortcut:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -STA -File .\PasteAutoma.ps1 -CsvPath .\input.csv -StartDelayMs 2000
+```
+
+Increase the time allowed for the clipboard to accept and verify each value:
+
+```powershell
+powershell -ExecutionPolicy Bypass -STA -File .\PasteAutoma.ps1 -CsvPath .\input.csv -ClipboardTimeoutMs 5000
+```
+
+Bypass the clipboard and type each row directly:
+
+```powershell
+powershell -ExecutionPolicy Bypass -STA -File .\PasteAutoma.ps1 -CsvPath .\input.csv -InputMode Type
 ```
 
 ## Options
@@ -115,9 +131,12 @@ With multiple columns, PasteAutoma pastes the row as tab-separated text by defau
 
 Use `-PasteFirstColumnOnly` when the target should receive only one value per row.
 
+If clipboard mode occasionally misses a paste, try `-InputMode Type`. It avoids the Windows clipboard entirely and sends the row as keyboard text.
+
 ## Safety Notes
 
 - Test with two or three rows before running a large list.
 - Keep the target app focused while the automation is running.
+- Watch the terminal logs. Each row prints `F2`, clipboard load, paste, `Enter`, and completion.
 - Your real `input.csv` is ignored by git so it is not accidentally committed.
 - Use `input.example.csv` as a template for sharing.
